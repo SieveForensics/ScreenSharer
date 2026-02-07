@@ -27,7 +27,7 @@ if (!(Test-Admin)) {
     Exit
 }
 
-Start-Sleep -s 1
+Start-Sleep 1
 
 function Add-Suspicion {
     param(
@@ -35,37 +35,19 @@ function Add-Suspicion {
         [string]$FileName,
         [string]$Reason
     )
+
     if (-not $Map.ContainsKey($FileName)) {
         $Map[$FileName] = New-Object System.Collections.Generic.List[string]
     }
     $Map[$FileName].Add($Reason)
 }
 
-function Get-PrefetchHeaderInfo {
-    param([string]$Path)
-
-    # Lee 8 bytes: 4 para signature (ASCII) y 4 para version (LE) si aplica
-    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-    try {
-        $br = New-Object System.IO.BinaryReader($fs)
-        $sigBytes = $br.ReadBytes(4)
-        $sig = [System.Text.Encoding]::ASCII.GetString($sigBytes)
-        $ver = $br.ReadInt32()  # little-endian
-        return [pscustomobject]@{
-            Signature = $sig
-            Version   = $ver
-        }
-    } finally {
-        $fs.Close()
-    }
-}
-
 function Get-ADSStreams {
     param([string]$Path)
 
     try {
-        $streams = Get-Item -LiteralPath $Path -Stream * -ErrorAction Stop
-        $streams | Where-Object { $_.Stream -ne ':$DATA' }
+        Get-Item -LiteralPath $Path -Stream * -ErrorAction Stop |
+        Where-Object { $_.Stream -ne ':$DATA' }
     } catch {
         @()
     }
@@ -73,41 +55,35 @@ function Get-ADSStreams {
 
 $files = Get-ChildItem -Path $directory -Filter *.pf -File -ErrorAction SilentlyContinue
 
-$hashTable = @{}         # hash -> list of file names
-$suspiciousFiles = @{}   # file -> list of reasons
+$hashTable = @{}
+$suspiciousFiles = @{}
 
 foreach ($file in $files) {
     try {
-        # 1) Atributos básicos
-        if ($file.IsReadOnly) { Add-Suspicion $suspiciousFiles $file.Name "File is read-only" }
-        if ($file.Attributes -band [IO.FileAttributes]::Hidden) { Add-Suspicion $suspiciousFiles $file.Name "Hidden attribute set" }
-        if ($file.Attributes -band [IO.FileAttributes]::System) { Add-Suspicion $suspiciousFiles $file.Name "System attribute set (unusual for many .pf)" }
-
-        # 2) Header binario (mejor que StreamReader)
-        $h = Get-PrefetchHeaderInfo -Path $file.FullName
-
-        $sigTrim = $h.Signature.Trim([char]0)
-
-        if ($sigTrim -notin @("SCCA","MAM")) {
-            Add-Suspicion $suspiciousFiles $file.Name "Unexpected PF signature: '$($h.Signature)'"
+        # === Attributes ===
+        if ($file.IsReadOnly) {
+            Add-Suspicion $suspiciousFiles $file.Name "File is read-only"
         }
 
-        if ($h.Version -le 0 -or $h.Version -gt 200) {
-            Add-Suspicion $suspiciousFiles $file.Name "Suspicious PF version field: $($h.Version)"
+        if ($file.Attributes -band [IO.FileAttributes]::Hidden) {
+            Add-Suspicion $suspiciousFiles $file.Name "Hidden attribute set"
         }
 
-        # ADS detection
+        if ($file.Attributes -band [IO.FileAttributes]::System) {
+            Add-Suspicion $suspiciousFiles $file.Name "System attribute set"
+        }
+
+        # === ADS Detection ===
         $ads = Get-ADSStreams -Path $file.FullName
-        foreach ($s in $ads) {
-            # Zone.Identifier puede existir si algo fue marcado como descargado, pero en Prefetch es raro.
-            $note = if ($s.Stream -eq "Zone.Identifier") {
-                "ADS present: Zone.Identifier (download mark) Size=$($s.Length)"
+        foreach ($stream in $ads) {
+            if ($stream.Stream -eq "Zone.Identifier") {
+                Add-Suspicion $suspiciousFiles $file.Name "ADS detected: Zone.Identifier (download mark) Size=$($stream.Length)"
             } else {
-                "ADS present: '$($s.Stream)' Size=$($s.Length)"
+                Add-Suspicion $suspiciousFiles $file.Name "ADS detected: '$($stream.Stream)' Size=$($stream.Length)"
             }
-            Add-Suspicion $suspiciousFiles $file.Name $note
         }
 
+        # === Hashing ===
         $hash = Get-FileHash -Path $file.FullName -Algorithm SHA256
         if ($hashTable.ContainsKey($hash.Hash)) {
             $hashTable[$hash.Hash].Add($file.Name)
@@ -116,6 +92,7 @@ foreach ($file in $files) {
             $hashTable[$hash.Hash].Add($file.Name)
         }
 
+        # === Timestamp Heuristics ===
         if ($file.LastWriteTimeUtc -lt $file.CreationTimeUtc.AddMinutes(-5)) {
             Add-Suspicion $suspiciousFiles $file.Name "Timestamp anomaly: LastWrite older than Creation (UTC)"
         }
@@ -125,21 +102,23 @@ foreach ($file in $files) {
     }
 }
 
-
+# === Duplicate Hash Analysis ===
 $repeatedHashes = $hashTable.GetEnumerator() | Where-Object { $_.Value.Count -gt 1 }
+
 foreach ($entry in $repeatedHashes) {
-    $list = ($entry.Value -join ", ")
-    foreach ($fn in $entry.Value) {
-        Add-Suspicion $suspiciousFiles $fn "Duplicate SHA256 with: $list"
+    $related = $entry.Value -join ", "
+    foreach ($fileName in $entry.Value) {
+        Add-Suspicion $suspiciousFiles $fileName "Duplicate SHA256 with: $related"
     }
 }
 
+# === Output ===
 if ($suspiciousFiles.Count) {
-    Write-Host "Suspicious PF files:" -ForegroundColor Yellow
-    foreach ($key in ($suspiciousFiles.Keys | Sort-Object)) {
+    Write-Host "Suspicious Prefetch files detected:" -ForegroundColor Yellow
+    foreach ($file in ($suspiciousFiles.Keys | Sort-Object)) {
         Write-Host ""
-        Write-Host "$key" -ForegroundColor Cyan
-        foreach ($reason in $suspiciousFiles[$key]) {
+        Write-Host "$file" -ForegroundColor Cyan
+        foreach ($reason in $suspiciousFiles[$file]) {
             Write-Host "  - $reason"
         }
     }
